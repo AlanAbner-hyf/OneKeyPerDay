@@ -6,6 +6,50 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <chrono>
+
+#include <cstddef>
+#include <limits>
+
+// 解析“十进制 Message ID:正文”。成功返回 true 并填写输出参数；
+// 失败返回 false，输出参数保持不变。缓冲区不需要以 '\0' 结尾。
+bool parse_message(const char* buffer, std::size_t data_size,
+                          std::uint32_t& message_id, std::string& message_content)
+{
+    if (buffer == nullptr) {
+        return false;
+    }
+
+    std::size_t pos = 0;
+    std::uint32_t parsed_id = 0;
+    constexpr std::uint32_t max_id = std::numeric_limits<std::uint32_t>::max();
+
+    // 只在实际收到的字节范围内寻找第一个冒号。
+    while (pos < data_size && buffer[pos] != ':') {
+        const char ch = buffer[pos];
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+
+        const std::uint32_t digit = static_cast<std::uint32_t>(ch - '0');
+        if (parsed_id > (max_id - digit) / 10) {
+            return false;
+        }
+
+        parsed_id = parsed_id * 10 + digit;
+        ++pos;
+    }
+
+    // 拒绝空 ID 和缺少冒号的数据报。
+    if (pos == 0 || pos == data_size) {
+        return false;
+    }
+
+    // 正文允许为空，也允许包含冒号和空字节。
+    message_content.assign(buffer + pos + 1, data_size - pos - 1);
+    message_id = parsed_id;
+    return true;
+}
 
 // 发送消息给服务器，并等待服务器的回显确认，最多重试两次
 int echo_with_retry(SOCKET sock, const char* server_ip,
@@ -26,74 +70,92 @@ int echo_with_retry(SOCKET sock, const char* server_ip,
             std::cerr << "sendto failed: " << WSAGetLastError() << '\n';
             return 1;
         }
+        // 本轮发送只有一个截止时间；收到旧回复不能重新计时。
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds(5);
         std::cout << "Attempt " << attempt << '/' << max_attempts
                   << ": sent " << sent << " bytes to " << server_ip
                   << ":9000: " << message << '\n'
                   << "Waiting for echo (up to 5 seconds)...\n" << std::flush;
 
-        // 用来接受服务器回显的缓冲区，最大为65536字节
-        char buffer[65536];
-        // 地址，表示我们收到的消息实际上是谁发出的
-        sockaddr_in sender_addr{};
-        int sender_addr_len = sizeof(sender_addr);
-        // 接收服务器回显，最多等待5秒
-        const int received = recvfrom(
-            sock, buffer, sizeof(buffer), 0,
-            reinterpret_cast<sockaddr*>(&sender_addr), &sender_addr_len);
-        if (received == SOCKET_ERROR) {
-            const int error = WSAGetLastError();
-            if (error == WSAETIMEDOUT) {
-                std::cout << "Timed out: no echo received within 5 seconds.\n";
-                // 如果没有收到回显，继续尝试发送同一条消息，最多重发2次
-                if (attempt < max_attempts) {
-                    std::cout << "Retrying the same message...\n";
+        // 内层只负责接收；只有本轮超时，才进入外层的下一次发送。
+        while (true) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+
+            // 向上取整，避免剩余不足 1 毫秒时变成 0（无限等待）。
+            const DWORD remaining_ms = static_cast<DWORD>(
+                std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count());
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                           reinterpret_cast<const char*>(&remaining_ms),
+                           sizeof(remaining_ms)) == SOCKET_ERROR) {
+                std::cerr << "setsockopt failed: " << WSAGetLastError() << '\n';
+                return 1;
+            }
+
+            // 用来接受服务器回显的缓冲区，最大为65536字节
+            char buffer[65536];
+            // 地址，表示我们收到的消息实际上是谁发出的
+            sockaddr_in sender_addr{};
+            int sender_addr_len = sizeof(sender_addr);
+            // 只等待本轮剩余时间，每次接收前重新初始化来源地址长度。
+            const int received = recvfrom(
+                sock, buffer, sizeof(buffer), 0,
+                reinterpret_cast<sockaddr*>(&sender_addr), &sender_addr_len);
+            if (received == SOCKET_ERROR) {
+                const int error = WSAGetLastError();
+                if (error == WSAETIMEDOUT) {
+                    // 返回循环顶部，用单调时钟检查是否已到截止时间。
+                    continue;
                 }
+                // 非超时的 socket 错误仍报告给调用方。
+                std::cerr << "recvfrom failed: " << error << '\n';
+                return 1;
+            }
+
+            // 实际上收到的消息可能来自其他地址或端口，必须检查是否与我们发送的服务器地址一致
+            if (sender_addr.sin_family != AF_INET ||
+                sender_addr.sin_addr.s_addr != server_addr.sin_addr.s_addr ||
+                sender_addr.sin_port != server_addr.sin_port) {
+                std::cerr << "Ignoring a datagram from an unexpected sender.\n";
                 continue;
             }
-            // 如果重发3次都没有收到回显，直接返回错误
-            std::cerr << "recvfrom failed: " << error << '\n';
-            return 1;
+
+            // 从buffer中提取消息ID和消息内容
+            std::uint32_t received_message_id = 0;
+            std::string received_message_content;
+            if (!parse_message(buffer, static_cast<std::size_t>(received),
+                               received_message_id, received_message_content)) {
+                std::cerr << "Ignoring invalid message: expected uint32 ID followed by ':'.\n";
+                continue;
+            }
+
+            // 先匹配 ID；旧消息的迟到回复不消耗重传次数。
+            if (received_message_id != message_id) {
+                std::cerr << "Ignoring reply for message ID " << received_message_id
+                          << "; waiting for ID " << message_id << ".\n";
+                continue;
+            }
+
+            if (received_message_content == message_content) {
+                std::cout << "Echo from " << server_ip << ":9000: ";
+                std::cout.write(buffer, received);
+                std::cout << "\nEcho OK.\n";
+                return 0;
+            }
+            else {
+                std::cerr << "Ignoring reply with unexpected content for ID "
+                          << message_id << ".\n";
+            }
         }
 
-        // 实际上收到的消息可能来自其他地址或端口，必须检查是否与我们发送的服务器地址一致
-        if (sender_addr.sin_family != AF_INET ||
-            sender_addr.sin_addr.s_addr != server_addr.sin_addr.s_addr ||
-            sender_addr.sin_port != server_addr.sin_port) {
-            std::cerr << "Received a datagram from an unexpected sender.\n";
-            return 1;
+        std::cout << "Timed out: no matching echo received within 5 seconds.\n";
+        if (attempt < max_attempts) {
+            std::cout << "Retrying the same message...\n";
         }
-
-        // 从buffer中提取消息ID和消息内容
-        const char* buffer_ptr = buffer;
-        uint32_t received_message_id = 0;
-        while (*buffer_ptr && *buffer_ptr != ':') {
-            received_message_id = received_message_id * 10 + (*buffer_ptr - '0');
-            ++buffer_ptr;
-        }
-        if (*buffer_ptr == ':') {
-            ++buffer_ptr;
-        }
-        std::string received_message(buffer_ptr, received - (buffer_ptr - buffer));
-
-        if (received != message_size) {
-            std::cerr << "Reply length did not match the original message length.\n";
-            return 1;
-        }
-        else if (received_message_id != message_id) {
-            std::cerr << "Reply message ID did not match the original message ID.\n";
-            return 1;
-        }
-        else if (received_message != message_content) {
-            std::cerr << "Reply message content did not match the original message content.\n";
-            return 1;
-        }
-
-        std::cout << "Echo from " << server_ip << ":9000: ";
-        std::cout.write(buffer, received);
-        std::cout << "\nEcho OK.\n";
-        return 0;
     }
-
     std::cerr << "No echo after " << max_attempts
               << " attempts; giving up.\n";
     return 1;
@@ -107,15 +169,6 @@ int run_client(SOCKET sock, const char* server_ip)
     server_addr.sin_port = htons(9000);
     if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1) {
         std::cerr << "Please provide a valid IPv4 address.\n";
-        return 1;
-    }
-
-    // Configure once; all input lines use the same socket and timeout.
-    const DWORD timeout_ms = 5000;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms),
-                   sizeof(timeout_ms)) == SOCKET_ERROR) {
-        std::cerr << "setsockopt failed: " << WSAGetLastError() << '\n';
         return 1;
     }
 
