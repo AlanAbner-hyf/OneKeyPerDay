@@ -926,7 +926,7 @@ t110 x=11
 
 这一节最容易和广义的“状态同步”混淆。
 
-Gaffer 这里的 State Synchronization 特指一种：
+Gaffer 这里的 State Synchronization 特指一种：（其实就是Fast-Paced-Multiplayer-Summary中的Server Reconciliation）
 
 > **客户端和服务器都运行 Simulation，但服务器持续发送部分对象状态进行纠偏。**
 
@@ -1683,15 +1683,15 @@ Reliable Ordered Messages
 
 # 8. 三种同步方案核心对比
 
-| 对比项             | Deterministic Lockstep | Snapshot Interpolation | State Synchronization |
-| ------------------ | ---------------------- | ---------------------- | --------------------- |
-| 主要同步内容       | Input                  | State Snapshot         | Input + 部分 State    |
-| 客户端是否自己模拟 | 是                     | 不依赖相同完整模拟     | 是                    |
-| 是否要求确定性     | 很高                   | 很低                   | 较低                  |
-| 网络带宽           | 低                     | 高                     | 中等                  |
-| 丢包容忍度         | 较低                   | 较高                   | 较高                  |
-| 状态误差           | 理论上不能有           | 服务器直接给结果       | 允许偏差后纠正        |
-| 典型思想           | 大家算一样             | 服务器告诉你结果       | 自己算，服务器纠偏    |
+| 对比项             | Deterministic Lockstep（帧同步） | Snapshot Interpolation（状态同步） | State Synchronization（Server Reconciliation服务器校正） |
+| ------------------ | -------------------------------- | ---------------------------------- | -------------------------------------------------------- |
+| 主要同步内容       | Input                            | State Snapshot                     | Input + 部分 State                                       |
+| 客户端是否自己模拟 | 是                               | 不依赖相同完整模拟                 | 是                                                       |
+| 是否要求确定性     | 很高                             | 很低                               | 较低                                                     |
+| 网络带宽           | 低                               | 高                                 | 中等                                                     |
+| 丢包容忍度         | 较低                             | 较高                               | 较高                                                     |
+| 状态误差           | 理论上不能有                     | 服务器直接给结果                   | 允许偏差后纠正                                           |
+| 典型思想           | 大家算一样                       | 服务器告诉你结果                   | 自己算，服务器纠偏                                       |
 
 一句话：
 
