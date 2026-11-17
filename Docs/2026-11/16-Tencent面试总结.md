@@ -124,3 +124,49 @@ DrawCall：
 - **优化**：复用材质、合批、GPU Instancing、剔除不可见物体。减少调用次数不保证一定更快，需同时观察 CPU / GPU 帧耗时。[Unity 官方文档：DrawCall 优化](https://docs.unity.com/en-us/engine/6000.6/manual/analysis/graphics-performance-profiling/reduce-draw-calls/optimizing-draw-calls)
 
 例：100 棵树使用相同 Mesh、相同材质，假设只有一个子网格和一个渲染 Pass，不合批时可产生 100 次 DrawCall；支持 GPU Instancing 时，可在实例数量限制内合为一次实例化绘制。[Unity 官方文档：GPU Instancing](https://docs.unity.com/en-us/engine/6000.6/manual/analysis/graphics-performance-profiling/reduce-draw-calls/gpuinstancing)
+
+内存对齐是什么？
+
+- **定义**：对象的起始地址必须满足类型的对齐要求。若要求 N 字节对齐，则 `地址 % N == 0`；N 不一定等于对象大小。
+- **结构体布局**：编译器会在成员之间或结构体末尾插入填充字节（padding），保证成员及数组中每个元素都满足对齐要求。
+- **C++ 查询与指定**：`alignof(T)` 查询对齐要求，`sizeof(T)` 包含填充字节，`alignas(N)` 可指定更严格的对齐。[C++ 标准草案：内存对齐](https://eel.is/c++draft/basic.align)
+
+例：假设 int 大小和对齐要求均为 4 字节，采用常见默认布局：
+
+```cpp
+struct A { char a; int b; char c; }; // 通常 sizeof(A) = 12
+// 偏移：a=0，填充=1~3，b=4~7，c=8，尾部填充=9~11
+
+struct B { int b; char a; char c; }; // 通常 sizeof(B) = 8
+// 偏移：b=0~3，a=4，c=5，尾部填充=6~7
+```
+
+调整成员顺序可减少填充；具体布局取决于平台 ABI、编译器及打包设置。
+
+为什么需要内存对齐？
+
+- **保证正确访问**：部分处理器或指令要求地址对齐，未对齐访问可能触发异常；C++ 中，在不满足类型对齐要求的存储上创建对象属于未定义行为。
+- **提高访问效率**：未对齐的数据可能跨越缓存行或内存页，导致额外访问和处理开销；即使硬件支持未对齐访问，也不代表性能相同。
+- **保证数组元素对齐**：结构体尾部填充让 `sizeof(T)` 满足对齐要求，数组按该步长排列时，后续元素仍然对齐。[Linux 内核文档：未对齐访问](https://docs.kernel.org/core-api/unaligned-memory-access.html)
+
+例：假设缓存行为 64 字节，从地址 60 读取 8 字节会跨越两条缓存行；从地址 64 读取则落在同一条缓存行。对齐本身不等于线程安全或原子性。
+
+虚拟地址空间是什么？
+
+- **定义**：进程可使用的虚拟地址范围，是程序看到的地址视图，不等于实际占用的物理内存。在常见现代操作系统中，普通指针保存的是虚拟地址。
+- **地址转换**：操作系统维护页表，CPU 的 MMU 将虚拟地址映射为物理地址；TLB 缓存近期的地址转换结果。
+- **进程关系**：不同进程通常拥有独立的地址空间，同一进程的线程共享地址空间。相同虚拟地址在不同进程中可以映射到不同物理页。
+- **地址布局**：通常包含代码、数据、堆、栈、共享库和内存映射区域；并非每个地址都有映射或访问权限。[Microsoft 官方文档：虚拟地址空间](https://learn.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/virtual-address-spaces)
+
+例：假设页大小为 4 KiB，虚拟地址 `0x1234` 的虚拟页号为 1，页内偏移为 `0x234`。若页表将该页映射到物理页框 9，则物理地址为 `0x9000 + 0x234 = 0x9234`。
+
+为什么需要虚拟地址空间？
+
+- **隔离与保护**：通过独立映射和读、写、执行权限，阻止进程随意访问其他进程或内核内存。
+- **简化内存分配**：连续的虚拟地址可以映射到不连续的物理页，程序不必关心数据实际放在哪块物理内存。
+- **按需使用物理内存**：可先保留地址范围，访问时再分配或调入物理页；结合文件映射、换页机制，可支持大于物理内存的地址空间，但容量和性能仍受资源限制。
+- **共享与复用**：多个进程可将共享库代码或共享内存映射到相同物理页，减少重复占用。[Microsoft 官方文档：虚拟地址空间](https://learn.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/virtual-address-spaces)
+
+例：程序申请一段 1 GiB 的按需分配匿名映射，只写入其中几个页时，通常只需为实际访问的部分分配物理页；不必立即占用 1 GiB RAM。
+
+注意：**虚拟地址空间不是交换文件**。即使关闭 swap，也仍然可以使用虚拟地址；缺页异常既可能触发正常的分配或调页，也可能因非法访问而导致进程报错。
